@@ -64,3 +64,10 @@ following settings help:
   reproducible.
 - Use [run_campaign][gradysim.simulator.campaign.run_campaign] to execute independent runs in parallel over every
   CPU core.
+- Mobility handlers send telemetry to every node at every update, which is often the most expensive part of a
+  simulation with few nodes. If your protocols don't need it that often, raise `telemetry_decimation` in the
+  mobility handler's configuration.
+
+Simulations with many nodes (see [VECTORIZATION_MIN_NODES][gradysim.simulator.node.VECTORIZATION_MIN_NODES])
+automatically switch mobility and broadcast computations to vectorized numpy code, which produces exactly the same
+results.

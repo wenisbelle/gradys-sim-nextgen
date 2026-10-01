@@ -7,19 +7,24 @@ distributed controllers that output velocity commands, such as
 soliton-like wave-based control laws for swarm encirclement.
 """
 
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
 
 from gradysim.protocol.messages.mobility import MobilityCommand, MobilityCommandType
 from gradysim.simulator.event import EventLoop
 from gradysim.simulator.handler.interface import INodeHandler
-from gradysim.simulator.node import Node
+from gradysim.simulator.node import VECTORIZATION_MIN_NODES, Node, PositionSnapshot
 
 from ..delivery import deliver_telemetry
 from .config import DynamicVelocityMobilityConfiguration
 from .core import (
     apply_acceleration_limits,
+    apply_acceleration_limits_vectorized,
     apply_velocity_limits,
+    apply_velocity_limits_vectorized,
     apply_velocity_tracking_first_order,
+    apply_velocity_tracking_first_order_vectorized,
     integrate_position,
 )
 from .telemetry import DynamicVelocityTelemetry
@@ -70,6 +75,14 @@ class DynamicVelocityMobilityHandler(INodeHandler):
         
         # Telemetry tracking: count updates per node
         self._update_counter: Dict[int, int] = {}
+
+        # State mirrored in arrays for the vectorized update, built when first needed and kept in sync
+        self._node_list: List[Node] = []
+        self._rows: Dict[int, int] = {}
+        self._positions: Optional[np.ndarray] = None
+        self._positions_version = -1
+        self._current_velocity_array: Optional[np.ndarray] = None
+        self._desired_velocity_array: Optional[np.ndarray] = None
     
     @staticmethod
     def get_label() -> str:
@@ -88,6 +101,7 @@ class DynamicVelocityMobilityHandler(INodeHandler):
         self._current_velocity[node_id] = (0.0, 0.0, 0.0)
         self._desired_velocity[node_id] = (0.0, 0.0, 0.0)
         self._update_counter[node_id] = 0
+        self._current_velocity_array = None
     
     def inject(self, event_loop: EventLoop):
         """
@@ -159,6 +173,9 @@ class DynamicVelocityMobilityHandler(INodeHandler):
             self._update_counter[node_id] = 0
         else:
             self._desired_velocity[node_id] = v_des
+            row = self._rows.get(node_id)
+            if self._current_velocity_array is not None and row is not None:
+                self._desired_velocity_array[row] = v_des
     
     def _get_node_velocity(self, node_id: int) -> Optional[Tuple[float, float, float]]:
         """
@@ -199,9 +216,31 @@ class DynamicVelocityMobilityHandler(INodeHandler):
         7. Schedules the next update
         """
         dt = self._config.update_rate
-        deliveries = []
 
-        # Update all nodes
+        if len(self._nodes) >= VECTORIZATION_MIN_NODES:
+            deliveries = self._mobility_update_vectorized(dt)
+        else:
+            deliveries = self._mobility_update_nodes(dt)
+
+        # Telemetry for every node is delivered by a single event, equivalent to one event per node
+        if deliveries:
+            self._loop.schedule_event(
+                self._loop.current_time,
+                lambda: deliver_telemetry(self._loop, deliveries),
+                "Mobility telemetry"
+            )
+
+        # Schedule next update
+        self._loop.schedule_event(
+            self._loop.current_time + self._config.update_rate,
+            self._mobility_update
+        )
+
+    def _mobility_update_nodes(self, dt: float) -> List[Tuple[Node, DynamicVelocityTelemetry]]:
+        """
+        Updates every node, one at a time. Returns the telemetry that should be delivered.
+        """
+        deliveries = []
         for node_id, node in self._nodes.items():
             # Get current and desired velocities
             v_current = self._current_velocity[node_id]
@@ -250,20 +289,65 @@ class DynamicVelocityMobilityHandler(INodeHandler):
             self._update_counter[node_id] += 1
             if self._should_emit_telemetry(node_id):
                 deliveries.append((node, self._make_telemetry(node)))
+        return deliveries
 
-        # Telemetry for every node is delivered by a single event, equivalent to one event per node
-        if deliveries:
-            self._loop.schedule_event(
-                self._loop.current_time,
-                lambda: deliver_telemetry(self._loop, deliveries),
-                "Mobility telemetry"
+    def _mobility_update_vectorized(self, dt: float) -> List[Tuple[Node, DynamicVelocityTelemetry]]:
+        """
+        Same computation as `_mobility_update_nodes`, performed on all nodes at once. Returns the telemetry that
+        should be delivered.
+        """
+        if self._current_velocity_array is None:
+            self._node_list = list(self._nodes.values())
+            self._rows = {node.id: row for row, node in enumerate(self._node_list)}
+            self._current_velocity_array = np.array([self._current_velocity[node.id] for node in self._node_list],
+                                                    dtype=float).reshape(-1, 3)
+            self._desired_velocity_array = np.array([self._desired_velocity[node.id] for node in self._node_list],
+                                                    dtype=float).reshape(-1, 3)
+            self._positions_version = -1
+        nodes = self._node_list
+
+        if self._positions_version != Node.position_version:
+            self._positions = np.array([node.position for node in nodes], dtype=float).reshape(-1, 3)
+
+        if self._config.tau_xy is None and self._config.tau_z is None:
+            velocities = apply_acceleration_limits_vectorized(
+                self._current_velocity_array,
+                self._desired_velocity_array,
+                dt,
+                self._config.max_acc_xy,
+                self._config.max_acc_z,
             )
+        else:
+            velocities = apply_velocity_tracking_first_order_vectorized(
+                self._current_velocity_array,
+                self._desired_velocity_array,
+                dt,
+                self._config.max_acc_xy,
+                self._config.max_acc_z,
+                tau_xy=self._config.tau_xy,
+                tau_z=self._config.tau_z,
+            )
+        velocities = apply_velocity_limits_vectorized(velocities, self._config.max_speed_xy, self._config.max_speed_z)
+        positions = self._positions + velocities * dt
 
-        # Schedule next update
-        self._loop.schedule_event(
-            self._loop.current_time + self._config.update_rate,
-            self._mobility_update
-        )
+        deliveries = []
+        emit_telemetry = self._config.send_telemetry
+        decimation = self._config.telemetry_decimation
+        for node, position, velocity in zip(nodes, positions.tolist(), velocities.tolist()):
+            node.position = (position[0], position[1], position[2])
+            velocity = (velocity[0], velocity[1], velocity[2])
+            self._current_velocity[node.id] = velocity
+            count = self._update_counter[node.id] + 1
+            self._update_counter[node.id] = count
+            if emit_telemetry and count % decimation == 0:
+                deliveries.append((node, DynamicVelocityTelemetry(current_position=node.position,
+                                                                  current_velocity=velocity)))
+
+        self._current_velocity_array = velocities
+        self._positions = positions
+        self._positions_version = Node.position_version
+        Node.position_snapshot = PositionSnapshot(Node.position_version, nodes, positions)
+        return deliveries
     
     def _should_emit_telemetry(self, node_id: int) -> bool:
         """

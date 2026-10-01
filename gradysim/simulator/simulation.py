@@ -360,19 +360,16 @@ class Simulator:
         Returns:
             True if the simulation is done, False otherwise
         """
-        if len(self._event_loop) == 0:
+        next_event = self._event_loop.peek_event()
+        if next_event is None:
             return True
 
-        if self._configuration.duration is not None:
-            next_event = self._event_loop.peek_event()
-
-            if next_event.timestamp > self._configuration.duration:
-                return True
-
-        if self._configuration.max_iterations is not None and self._iteration >= self._configuration.max_iterations:
+        duration = self._configuration.duration
+        if duration is not None and next_event.timestamp > duration:
             return True
 
-        return False
+        max_iterations = self._configuration.max_iterations
+        return max_iterations is not None and self._iteration >= max_iterations
 
 
 class PositionScheme:

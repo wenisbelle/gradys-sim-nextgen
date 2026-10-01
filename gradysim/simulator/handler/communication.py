@@ -7,11 +7,11 @@ import numpy as np
 from gradysim.simulator.event import EventLoop
 from gradysim.simulator.log import node_context
 from gradysim.protocol.messages.communication import CommunicationCommand, CommunicationCommandType
-from gradysim.simulator.node import Node
+from gradysim.simulator.node import VECTORIZATION_MIN_NODES, Node, square
 from gradysim.protocol.position import Position
 from gradysim.simulator.handler.interface import INodeHandler
 
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 
 class CommunicationDestination:
@@ -137,6 +137,9 @@ class CommunicationHandler(INodeHandler):
         self._index_endpoints: List[CommunicationDestination] = []
         self._index_positions: np.ndarray = np.empty((0, 3))
         self._index_version = -1
+        self._index_candidate_version = -1
+        self._snapshot_nodes: Optional[List[Node]] = None
+        self._snapshot_endpoints: Optional[List[CommunicationDestination]] = None
 
         self.default_medium = communication_medium
 
@@ -150,6 +153,8 @@ class CommunicationHandler(INodeHandler):
                                          "node handler")
         self._sources[node.id] = CommunicationSource(node)
         self._destinations[node.id] = CommunicationDestination(node)
+        self._index_version = -1
+        self._snapshot_nodes = None
 
     def handle_command(self,
                        command: CommunicationCommand,
@@ -192,25 +197,71 @@ class CommunicationHandler(INodeHandler):
         """
         Returns every registered destination, except the source itself, within the medium's transmission range of
         the source. Destinations are returned in registration order.
+
+        Small simulations are checked one destination at a time. Larger ones use a vectorized distance computation
+        over an array of positions, preferably a snapshot published by the mobility handler.
         """
-        if self._index_version != Node.position_version or len(self._index_endpoints) != len(self._destinations):
+        if len(self._destinations) >= VECTORIZATION_MIN_NODES:
+            index = self._position_index()
+            if index is not None:
+                endpoints, positions = index
+                sx, sy, sz = source.node.position
+                dx = positions[:, 0] - sx
+                dy = positions[:, 1] - sy
+                dz = positions[:, 2] - sz
+                squared_range = medium.transmission_range ** 2
+                squared_distance = dx * dx + dy * dy + dz * dz
+                in_range = squared_distance <= squared_range
+
+                # can_transmit squares with Python's `**`, which can differ from `x * x` in the last bit. Distances
+                # that close to the range are recomputed exactly the same way, so both always agree.
+                borderline = np.flatnonzero(np.abs(squared_distance - squared_range) <= squared_range * 1e-12)
+                if borderline.size:
+                    in_range[borderline] = (square(dx[borderline]) + square(dy[borderline])
+                                            + square(dz[borderline])) <= squared_range
+
+                source_node = source.node
+                return [endpoints[row] for row in np.flatnonzero(in_range).tolist()
+                        if endpoints[row].node is not source_node]
+
+        source_node = source.node
+        sx, sy, sz = source_node.position
+        squared_range = medium.transmission_range ** 2
+        endpoints = []
+        for destination in self._destinations.values():
+            x, y, z = destination.node.position
+            if (x - sx) ** 2 + (y - sy) ** 2 + (z - sz) ** 2 <= squared_range and destination.node is not source_node:
+                endpoints.append(destination)
+        return endpoints
+
+    def _position_index(self) -> Optional[Tuple[List[CommunicationDestination], np.ndarray]]:
+        """
+        Returns destinations and an array with their current positions, row by row, or None when building the
+        array isn't worth it.
+        """
+        snapshot = Node.valid_position_snapshot()
+        if snapshot is not None:
+            if snapshot.nodes is not self._snapshot_nodes:
+                self._snapshot_nodes = snapshot.nodes
+                self._snapshot_endpoints = [self._destinations.get(node.id) for node in snapshot.nodes]
+                if len(snapshot.nodes) != len(self._destinations) or any(
+                        endpoint is None or endpoint.node is not node
+                        for endpoint, node in zip(self._snapshot_endpoints, snapshot.nodes)):
+                    self._snapshot_endpoints = None
+            if self._snapshot_endpoints is not None:
+                return self._snapshot_endpoints, snapshot.positions
+
+        if self._index_version != Node.position_version:
+            # Gathering positions costs about as much as checking every destination once, so the array is only
+            # built when positions are used by more than one broadcast
+            if self._index_candidate_version != Node.position_version:
+                self._index_candidate_version = Node.position_version
+                return None
             self._index_endpoints = list(self._destinations.values())
             self._index_positions = np.array([endpoint.node.position for endpoint in self._index_endpoints],
                                              dtype=float).reshape(-1, 3)
             self._index_version = Node.position_version
-
-        sx, sy, sz = source.node.position
-        positions = self._index_positions
-        dx = positions[:, 0] - sx
-        dy = positions[:, 1] - sy
-        dz = positions[:, 2] - sz
-        # Same operation order as can_transmit, so both agree exactly on boundary cases
-        in_range = (dx * dx + dy * dy + dz * dz) <= medium.transmission_range ** 2
-
-        endpoints = self._index_endpoints
-        source_node = source.node
-        return [endpoints[index] for index in np.flatnonzero(in_range).tolist()
-                if endpoints[index].node is not source_node]
+        return self._index_endpoints, self._index_positions
 
     def _broadcast_message(self, message: str, source: CommunicationSource, medium: CommunicationMedium):
         """
