@@ -14,6 +14,7 @@ from gradysim.simulator.event import EventLoop
 from gradysim.simulator.handler.interface import INodeHandler
 from gradysim.simulator.node import Node
 
+from ..delivery import deliver_telemetry
 from .config import DynamicVelocityMobilityConfiguration
 from .core import (
     apply_acceleration_limits,
@@ -113,16 +114,6 @@ class DynamicVelocityMobilityHandler(INodeHandler):
         """Finalize handler after simulation ends (not used by this handler)."""
         pass
     
-    def after_simulation_step(self, iteration: int, time: float):
-        """
-        Called after each simulation step.
-        
-        Args:
-            iteration: Current simulation iteration number
-            time: Current simulation time
-        """
-        pass
-
     def handle_command(self, command: MobilityCommand, node: Node):
         """
         Performs a mobility command. This method is called by the node's
@@ -208,7 +199,8 @@ class DynamicVelocityMobilityHandler(INodeHandler):
         7. Schedules the next update
         """
         dt = self._config.update_rate
-        
+        deliveries = []
+
         # Update all nodes
         for node_id, node in self._nodes.items():
             # Get current and desired velocities
@@ -257,8 +249,16 @@ class DynamicVelocityMobilityHandler(INodeHandler):
             # Update counter and emit telemetry if needed
             self._update_counter[node_id] += 1
             if self._should_emit_telemetry(node_id):
-                self._emit_telemetry(node)
-        
+                deliveries.append((node, self._make_telemetry(node)))
+
+        # Telemetry for every node is delivered by a single event, equivalent to one event per node
+        if deliveries:
+            self._loop.schedule_event(
+                self._loop.current_time,
+                lambda: deliver_telemetry(self._loop, deliveries),
+                "Mobility telemetry"
+            )
+
         # Schedule next update
         self._loop.schedule_event(
             self._loop.current_time + self._config.update_rate,
@@ -281,26 +281,14 @@ class DynamicVelocityMobilityHandler(INodeHandler):
         count = self._update_counter[node_id]
         return (count % self._config.telemetry_decimation) == 0
     
-    def _emit_telemetry(self, node: Node):
+    def _make_telemetry(self, node: Node) -> DynamicVelocityTelemetry:
         """
-        Emit a Telemetry message with the current node position.
-        
+        Build a Telemetry message with the current node position and velocity.
+
         Args:
-            node: The node to emit telemetry for.
-        
-        The telemetry is sent directly to the node's protocol encapsulator.
+            node: The node to build telemetry for.
         """
-        telemetry = DynamicVelocityTelemetry(
+        return DynamicVelocityTelemetry(
             current_position=node.position,
             current_velocity=self._get_node_velocity(node.id),
-        )
-        
-        # Schedule telemetry delivery to protocol (same pattern as MobilityHandler)
-        def send_telemetry():
-            node.protocol_encapsulator.handle_telemetry(telemetry)
-        
-        self._loop.schedule_event(
-            self._loop.current_time,
-            send_telemetry,
-            f"Node {node.id} handle_telemetry"
         )

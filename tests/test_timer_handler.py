@@ -87,14 +87,10 @@ class TestTimerHandler(unittest.TestCase):
         timer_handler.set_timer("test", 10, node)
         timer_handler.cancel_timer("test", node)
 
-        self.assertEqual(len(event_loop), 1)
-
-        # Event still fires, but should not be handled
-        event = event_loop.pop_event()
-        self.assertEqual(event.timestamp, 10)
-        event.callback()
+        # Cancelled timers are removed from the event loop
+        self.assertEqual(len(event_loop), 0)
+        self.assertIsNone(event_loop.peek_event())
         self.assertEqual(received, 0)
-
 
     def test_cancel_non_existing_timer(self):
         event_loop, timer_handler = create_timer_handler()
@@ -124,17 +120,7 @@ class TestTimerHandler(unittest.TestCase):
         timer_handler.set_timer("test", 20, node)
         timer_handler.cancel_timer("test", node)
 
-        self.assertEqual(len(event_loop), 2)
-
-        # Event still fires, but should not be handled
-        event = event_loop.pop_event()
-        self.assertEqual(event.timestamp, 10)
-        event.callback()
-        self.assertEqual(received, 0)
-
-        event = event_loop.pop_event()
-        self.assertEqual(event.timestamp, 20)
-        event.callback()
+        self.assertEqual(len(event_loop), 0)
         self.assertEqual(received, 0)
 
     def test_schedule_after_cancel(self):
@@ -156,20 +142,14 @@ class TestTimerHandler(unittest.TestCase):
         timer_handler.cancel_timer("test", node)
         timer_handler.set_timer("test", 20, node)
 
-        self.assertEqual(len(event_loop), 2)
-
-        # Event still fires, but should not be handled
-        event = event_loop.pop_event()
-        self.assertEqual(event.timestamp, 10)
-        event.callback()
-        self.assertEqual(received, 0)
+        self.assertEqual(len(event_loop), 1)
 
         event = event_loop.pop_event()
         self.assertEqual(event.timestamp, 20)
         event.callback()
         self.assertEqual(received, 1)
 
-    def cancel_one_node_doesnt_affect_another(self):
+    def test_cancel_one_node_doesnt_affect_another(self):
         event_loop, timer_handler = create_timer_handler()
 
         received = 0
@@ -193,15 +173,59 @@ class TestTimerHandler(unittest.TestCase):
         timer_handler.set_timer("test", 20, node2)
         timer_handler.cancel_timer("test", node1)
 
-        self.assertEqual(len(event_loop), 2)
-
-        # Event still fires, but should not be handled
-        event = event_loop.pop_event()
-        self.assertEqual(event.timestamp, 10)
-        event.callback()
-        self.assertEqual(received, 0)
+        self.assertEqual(len(event_loop), 1)
 
         event = event_loop.pop_event()
         self.assertEqual(event.timestamp, 20)
         event.callback()
         self.assertEqual(received, 1)
+
+    def test_cancel_timer_inside_its_own_handler(self):
+        event_loop, timer_handler = create_timer_handler()
+
+        received = 0
+
+        class DummyEncapsulator:
+            def handle_timer(self, msg: str):
+                nonlocal received
+                received += 1
+                timer_handler.cancel_timer(msg, node)
+
+        node = Node()
+        node.id = 0
+        node.protocol_encapsulator = DummyEncapsulator()
+
+        timer_handler.register_node(node)
+        timer_handler.set_timer("test", 10, node)
+        timer_handler.set_timer("test", 20, node)
+
+        event_loop.pop_event().callback()
+
+        self.assertEqual(received, 1)
+        self.assertEqual(len(event_loop), 0)
+
+    def test_reschedule_timer_inside_its_own_handler(self):
+        event_loop, timer_handler = create_timer_handler()
+
+        received = 0
+
+        class DummyEncapsulator:
+            def handle_timer(self, msg: str):
+                nonlocal received
+                received += 1
+                timer_handler.cancel_timer(msg, node)
+                timer_handler.set_timer(msg, event_loop.current_time + 1, node)
+
+        node = Node()
+        node.id = 0
+        node.protocol_encapsulator = DummyEncapsulator()
+
+        timer_handler.register_node(node)
+        timer_handler.set_timer("test", 10, node)
+
+        for _ in range(3):
+            event_loop.pop_event().callback()
+
+        self.assertEqual(received, 3)
+        self.assertEqual(len(event_loop), 1)
+        self.assertEqual(event_loop.peek_event().timestamp, 13)

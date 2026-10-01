@@ -2,14 +2,16 @@ import logging
 import random
 from dataclasses import dataclass
 
+import numpy as np
+
 from gradysim.simulator.event import EventLoop
-from gradysim.simulator.log import label_node
+from gradysim.simulator.log import node_context
 from gradysim.protocol.messages.communication import CommunicationCommand, CommunicationCommandType
 from gradysim.simulator.node import Node
 from gradysim.protocol.position import Position
 from gradysim.simulator.handler.interface import INodeHandler
 
-from typing import Dict
+from typing import Dict, List
 
 
 class CommunicationDestination:
@@ -34,7 +36,7 @@ class CommunicationDestination:
         """
         Function responsible for receiving the message through the communication handler.
         """
-        self._logger.debug(f"Node {self.node.id} received message from {source.node.id}")
+        self._logger.debug("Node %s received message from %s", self.node.id, source.node.id)
 
         self.node.protocol_encapsulator.handle_packet(message)
 
@@ -65,7 +67,7 @@ class CommunicationSource:
             message: Message being delivered
             endpoint: Destination of the message being delivered
         """
-        self._logger.debug(f"Node {self.node.id} sending message to {endpoint.node.id}")
+        self._logger.debug("Node %s sending message to %s", self.node.id, endpoint.node.id)
 
 
 class CommunicationException(Exception):
@@ -130,6 +132,12 @@ class CommunicationHandler(INodeHandler):
         self._sources: Dict[int, CommunicationSource] = {}
         self._destinations: Dict[int, CommunicationDestination] = {}
 
+        # Position index used to find broadcast receivers with vectorized distance computations. Rebuilt lazily
+        # whenever a node moves or a node is registered.
+        self._index_endpoints: List[CommunicationDestination] = []
+        self._index_positions: np.ndarray = np.empty((0, 3))
+        self._index_version = -1
+
         self.default_medium = communication_medium
 
     def inject(self, event_loop: EventLoop):
@@ -168,9 +176,7 @@ class CommunicationHandler(INodeHandler):
             medium = self.default_medium
 
         if command.command_type == CommunicationCommandType.BROADCAST:
-            for destination, endpoint in self._destinations.items():
-                if destination != sender.id:
-                    self._transmit_message(command.message, source, endpoint, medium)
+            self._broadcast_message(command.message, source, medium)
         else:
             destination = command.destination
             if destination is None:
@@ -181,6 +187,42 @@ class CommunicationHandler(INodeHandler):
 
             self._transmit_message(command.message, source, self._destinations[destination], medium)
 
+    def _in_range_endpoints(self, source: CommunicationSource, medium: CommunicationMedium) \
+            -> List[CommunicationDestination]:
+        """
+        Returns every registered destination, except the source itself, within the medium's transmission range of
+        the source. Destinations are returned in registration order.
+        """
+        if self._index_version != Node.position_version or len(self._index_endpoints) != len(self._destinations):
+            self._index_endpoints = list(self._destinations.values())
+            self._index_positions = np.array([endpoint.node.position for endpoint in self._index_endpoints],
+                                             dtype=float).reshape(-1, 3)
+            self._index_version = Node.position_version
+
+        sx, sy, sz = source.node.position
+        positions = self._index_positions
+        dx = positions[:, 0] - sx
+        dy = positions[:, 1] - sy
+        dz = positions[:, 2] - sz
+        # Same operation order as can_transmit, so both agree exactly on boundary cases
+        in_range = (dx * dx + dy * dy + dz * dz) <= medium.transmission_range ** 2
+
+        endpoints = self._index_endpoints
+        source_node = source.node
+        return [endpoints[index] for index in np.flatnonzero(in_range).tolist()
+                if endpoints[index].node is not source_node]
+
+    def _broadcast_message(self, message: str, source: CommunicationSource, medium: CommunicationMedium):
+        """
+        Transmits a message from source to every destination in range through the communication medium.
+        """
+        failure_rate = medium.failure_rate
+        for destination in self._in_range_endpoints(source, medium):
+            source.hand_over_message(message, destination)
+            if failure_rate > 0 and random.random() <= failure_rate:
+                continue
+            self._schedule_delivery(message, source, destination, medium)
+
     def _transmit_message(self, message: str, source: CommunicationSource, destination: CommunicationDestination,
                           medium: CommunicationMedium):
         """
@@ -189,15 +231,13 @@ class CommunicationHandler(INodeHandler):
         source.hand_over_message(message, destination)
 
         if can_transmit(source.node.position, destination.node.position, medium):
-            if medium.delay <= 0:
-                self._event_loop.schedule_event(
-                    self._event_loop.current_time,
-                    lambda: destination.receive_message(message, source),
-                    label_node(destination.node) + " handle_packet"
-                )
-            else:
-                self._event_loop.schedule_event(
-                    self._event_loop.current_time + medium.delay,
-                    lambda: destination.receive_message(message, source),
-                    label_node(destination.node) + " handle_packet"
-                )
+            self._schedule_delivery(message, source, destination, medium)
+
+    def _schedule_delivery(self, message: str, source: CommunicationSource, destination: CommunicationDestination,
+                           medium: CommunicationMedium):
+        delay = max(0, medium.delay)
+        self._event_loop.schedule_event(
+            self._event_loop.current_time + delay,
+            lambda: destination.receive_message(message, source),
+            node_context(destination.node, "handle_packet")
+        )

@@ -7,8 +7,9 @@ from gradysim.protocol.messages.telemetry import Telemetry
 from gradysim.protocol.position import Position, geo_to_cartesian
 from gradysim.simulator.event import EventLoop
 from gradysim.simulator.handler.interface import INodeHandler
-from gradysim.simulator.log import label_node
 from gradysim.simulator.node import Node
+
+from .delivery import deliver_telemetry
 
 
 class MasslessMobilityException(Exception):
@@ -85,18 +86,17 @@ class MasslessMobilityHandler(INodeHandler):
         self.speeds[node.id] = self._configuration.default_speed
 
     def _update_movement(self):
-        for node_id in self.nodes.keys():
-            node = self.nodes[node_id]
-
+        update_rate = self._configuration.update_rate
+        deliveries = []
+        for node_id, node in self.nodes.items():
             # If the node has a target update its position
-            if node_id in self.targets:
-                target = self.targets[node_id]
+            target = self.targets.get(node_id)
+            if target is not None:
                 current_position = node.position
-                speed = self.speeds[node_id]
                 target_vector: Position = (target[0] - current_position[0],
                                            target[1] - current_position[1],
                                            target[2] - current_position[2])
-                movement_multiplier = speed * self._configuration.update_rate
+                movement_multiplier = self.speeds[node_id] * update_rate
                 distance_delta = math.sqrt(target_vector[0] ** 2 + target_vector[1] ** 2 + target_vector[2] ** 2)
 
                 if movement_multiplier >= distance_delta:
@@ -113,18 +113,18 @@ class MasslessMobilityHandler(INodeHandler):
                         current_position[1] + target_vector[1] * target_vector_multiplier,
                         current_position[2] + target_vector[2] * target_vector_multiplier
                     )
-            telemetry = Telemetry(current_position=node.position)
+            deliveries.append((node, Telemetry(current_position=node.position)))
 
-            def make_send_telemetry(node_ref, telemetry_ref):
-                return lambda: node_ref.protocol_encapsulator.handle_telemetry(telemetry_ref)
-
+        # Telemetry for every node is delivered by a single event, in node order. Since events with the same
+        # timestamp run in scheduling order, this is equivalent to one event per node, but much cheaper.
+        if deliveries:
             self._event_loop.schedule_event(
                 self._event_loop.current_time,
-                make_send_telemetry(node, telemetry),
-                label_node(node) + " handle_telemetry"
+                lambda: deliver_telemetry(self._event_loop, deliveries),
+                "Mobility telemetry"
             )
 
-        self._event_loop.schedule_event(self._event_loop.current_time + self._configuration.update_rate,
+        self._event_loop.schedule_event(self._event_loop.current_time + update_rate,
                                         self._update_movement,
                                         "Mobility")
 
