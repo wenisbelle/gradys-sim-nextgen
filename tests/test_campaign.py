@@ -1,9 +1,10 @@
 import logging
+import os
 import random
 import unittest
 
 from gradysim.protocol.interface import IProtocol
-from gradysim.simulator.campaign import run_campaign
+from gradysim.simulator.campaign import Campaign, run_campaign
 from gradysim.simulator.handler.timer import TimerHandler
 from gradysim.simulator.simulation import SimulationBuilder, SimulationConfiguration
 
@@ -41,6 +42,14 @@ def square(value):
     return value * value
 
 
+def worker_pid(_):
+    return os.getpid()
+
+
+def divide_by_zero(value):
+    return value / 0
+
+
 class TestCampaign(unittest.TestCase):
     def test_seed_makes_runs_reproducible(self):
         self.assertEqual(run_seeded(1), run_seeded(1))
@@ -63,3 +72,21 @@ class TestCampaign(unittest.TestCase):
         simulation_handlers = [handler for handler in logger.handlers
                                if getattr(handler, "_gradysim_simulation_handler", False)]
         self.assertEqual(len(simulation_handlers), 1)
+
+    def test_campaign_reuses_workers_across_batches(self):
+        with Campaign(workers=2) as campaign:
+            first = campaign.map(worker_pid, range(4))
+            second = campaign.map(worker_pid, range(4))
+            self.assertEqual(campaign.map(square, range(5)), [0, 1, 4, 9, 16])
+        self.assertLessEqual(len(set(first) | set(second)), 2)
+
+    def test_campaign_submit(self):
+        with Campaign(workers=2) as campaign:
+            futures = [campaign.submit(square, value) for value in range(4)]
+            self.assertEqual([future.result() for future in futures], [0, 1, 4, 9])
+
+    def test_sequential_campaign_submit_reports_errors(self):
+        with Campaign(workers=1) as campaign:
+            self.assertEqual(campaign.submit(square, 3).result(), 9)
+            with self.assertRaises(ZeroDivisionError):
+                campaign.submit(divide_by_zero, 1).result()
