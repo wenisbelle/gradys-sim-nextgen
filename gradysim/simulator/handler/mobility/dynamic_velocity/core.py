@@ -13,6 +13,10 @@ easy to test and reuse independently of the simulation framework.
 import math
 from typing import Optional, Tuple
 
+import numpy as np
+
+from gradysim.simulator.node import square
+
 
 def apply_acceleration_limits(
     v_current: Tuple[float, float, float],
@@ -231,3 +235,88 @@ def integrate_position(
         z + vz * dt
     )
 
+
+
+# Vectorized versions of the functions above. They operate on arrays of shape (n, 3) holding one vector per node,
+# and perform the same floating point operations in the same order, so results are identical to the scalar versions.
+
+def _limit_xy_norm(dx: np.ndarray, dy: np.ndarray, limit: float, require_positive_norm: bool):
+    norm = np.sqrt(square(dx) + square(dy))
+    exceeded = norm > limit
+    if require_positive_norm:
+        exceeded &= norm > 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scale = np.where(exceeded, limit / norm, 1.0)
+    return dx * scale, dy * scale
+
+
+def _limit_abs(values: np.ndarray, limit: float) -> np.ndarray:
+    return np.where(np.abs(values) > limit, np.copysign(limit, values), values)
+
+
+def apply_acceleration_limits_vectorized(
+    v_current: np.ndarray,
+    v_desired: np.ndarray,
+    dt: float,
+    max_acc_xy: float,
+    max_acc_z: float
+) -> np.ndarray:
+    """
+    Vectorized version of [apply_acceleration_limits][gradysim.simulator.handler.mobility.dynamic_velocity.core.apply_acceleration_limits]
+    operating on arrays of shape (n, 3).
+    """
+    dvx, dvy = _limit_xy_norm(v_desired[:, 0] - v_current[:, 0], v_desired[:, 1] - v_current[:, 1],
+                              max_acc_xy * dt, require_positive_norm=False)
+    dvz = _limit_abs(v_desired[:, 2] - v_current[:, 2], max_acc_z * dt)
+    return np.column_stack((v_current[:, 0] + dvx, v_current[:, 1] + dvy, v_current[:, 2] + dvz))
+
+
+def apply_velocity_tracking_first_order_vectorized(
+    v_current: np.ndarray,
+    v_desired: np.ndarray,
+    dt: float,
+    max_acc_xy: float,
+    max_acc_z: float,
+    tau_xy: Optional[float],
+    tau_z: Optional[float],
+) -> np.ndarray:
+    """
+    Vectorized version of [apply_velocity_tracking_first_order][gradysim.simulator.handler.mobility.dynamic_velocity.core.apply_velocity_tracking_first_order]
+    operating on arrays of shape (n, 3).
+    """
+    if dt <= 0:
+        raise ValueError("dt must be > 0")
+    if max_acc_xy < 0 or max_acc_z < 0:
+        raise ValueError("max_acc must be >= 0")
+    if tau_xy is not None and tau_xy <= 0:
+        raise ValueError("tau_xy must be > 0 when provided")
+    if tau_z is not None and tau_z <= 0:
+        raise ValueError("tau_z must be > 0 when provided")
+
+    if tau_xy is None:
+        dvx, dvy = _limit_xy_norm(v_desired[:, 0] - v_current[:, 0], v_desired[:, 1] - v_current[:, 1],
+                                  max_acc_xy * dt, require_positive_norm=True)
+        vx_new = v_current[:, 0] + dvx
+        vy_new = v_current[:, 1] + dvy
+    else:
+        ax, ay = _limit_xy_norm((v_desired[:, 0] - v_current[:, 0]) / tau_xy,
+                                (v_desired[:, 1] - v_current[:, 1]) / tau_xy,
+                                max_acc_xy, require_positive_norm=True)
+        vx_new = v_current[:, 0] + ax * dt
+        vy_new = v_current[:, 1] + ay * dt
+
+    if tau_z is None:
+        vz_new = v_current[:, 2] + _limit_abs(v_desired[:, 2] - v_current[:, 2], max_acc_z * dt)
+    else:
+        vz_new = v_current[:, 2] + _limit_abs((v_desired[:, 2] - v_current[:, 2]) / tau_z, max_acc_z) * dt
+
+    return np.column_stack((vx_new, vy_new, vz_new))
+
+
+def apply_velocity_limits_vectorized(v: np.ndarray, max_speed_xy: float, max_speed_z: float) -> np.ndarray:
+    """
+    Vectorized version of [apply_velocity_limits][gradysim.simulator.handler.mobility.dynamic_velocity.core.apply_velocity_limits]
+    operating on arrays of shape (n, 3).
+    """
+    vx, vy = _limit_xy_norm(v[:, 0], v[:, 1], max_speed_xy, require_positive_norm=False)
+    return np.column_stack((vx, vy, _limit_abs(v[:, 2], max_speed_z)))

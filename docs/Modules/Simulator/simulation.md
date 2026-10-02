@@ -53,3 +53,21 @@ are fired. To better understand the simulation you can check how the
 :::gradysim.simulator.simulation.Simulator
     options:
         heading_level: 3
+## Running many simulations efficiently
+
+When a simulation is used as part of a larger workflow, like a parameter sweep or an optimization loop, the
+following settings help:
+
+- Set `execution_logging=False` in [SimulationConfiguration][gradysim.simulator.simulation.SimulationConfiguration]
+  to skip annotating every log line with the simulation state.
+- Set `seed` in [SimulationConfiguration][gradysim.simulator.simulation.SimulationConfiguration] to make each run
+  reproducible.
+- Use [run_campaign][gradysim.simulator.campaign.run_campaign] to execute independent runs in parallel over every
+  CPU core.
+- Mobility handlers send telemetry to every node at every update, which is often the most expensive part of a
+  simulation with few nodes. If your protocols don't need it that often, raise `telemetry_decimation` in the
+  mobility handler's configuration.
+
+Simulations with many nodes (see [VECTORIZATION_MIN_NODES][gradysim.simulator.node.VECTORIZATION_MIN_NODES])
+automatically switch mobility and broadcast computations to vectorized numpy code, which produces exactly the same
+results.

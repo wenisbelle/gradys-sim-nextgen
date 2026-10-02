@@ -5,7 +5,9 @@ import time
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
-from typing import Type, Optional, Dict, Tuple, Union
+from typing import Type, Optional, Dict, List, Tuple, Union
+
+import numpy as np
 
 from gradysim.encapsulator.python import PythonEncapsulator
 from gradysim.protocol.interface import IProtocol
@@ -81,6 +83,13 @@ class SimulationConfiguration:
     information about the simulation execution. This can be useful to identify bottlenecks in the simulation.
     """
 
+    seed: Optional[int] = None
+    """
+    If set, Python's `random` module (and numpy's global random generator) are seeded with this value when the
+    simulator is built, before any protocol is instantiated. Use it to make simulation runs reproducible, and give
+    each independent run of a campaign its own seed.
+    """
+
 
 
 class Simulator:
@@ -102,9 +111,19 @@ class Simulator:
             handlers: Dictionary of handlers indexed by their labels
             configuration: Simulation configuration
         """
+        if configuration.seed is not None:
+            random.seed(configuration.seed)
+            np.random.seed(configuration.seed)
+
         self._event_loop = EventLoop()
         self._nodes: Dict[int, Node] = {}
         self._handlers: Dict[str, INodeHandler] = handlers
+
+        # Only handlers that actually implement after_simulation_step are called after every event
+        self._step_handlers: List[INodeHandler] = [
+            handler for handler in handlers.values()
+            if type(handler).after_simulation_step is not INodeHandler.after_simulation_step
+        ]
 
         for handler in self._handlers.values():
             handler.inject(self._event_loop)
@@ -119,6 +138,9 @@ class Simulator:
 
         self._formatter = setup_simulation_formatter(configuration.debug, configuration.log_file)
         self._logger = logging.getLogger()
+
+        if configuration.execution_logging:
+            self._event_loop.set_context_listener(self._formatter.scope_context)
 
         self._initialized = False
         self._finalized = False
@@ -184,7 +206,7 @@ class Simulator:
         if not self._configuration.execution_logging:
             return
 
-        self._formatter.prefix = f"[it={iteration} time={timedelta(seconds=timestamp)} | {context}] "
+        self._formatter.scope(iteration, timestamp, context)
 
     def _initialize_simulation(self) -> None:
         self._initialized = True
@@ -246,25 +268,28 @@ class Simulator:
 
 
         event = self._event_loop.pop_event()
-        self.scope_event(self._iteration, event.timestamp, event.context)
+        if self._configuration.execution_logging:
+            self._formatter.scope(self._iteration, event.timestamp, event.context)
 
-        if self._configuration.profile:
-            start_time = time.time()
-        
         simulation_exception = None
 
-        try:
-            event.callback()
-        except Exception as e:
-            simulation_exception = e
-        
         if self._configuration.profile:
+            start_time = time.perf_counter()
+            try:
+                event.callback()
+            except Exception as e:
+                simulation_exception = e
             self._profiling_context_total_count[event.context] = (
                     self._profiling_context_total_count.get(event.context, 0) + 1)
             self._profiling_context_total_time[event.context] = (
-                    self._profiling_context_total_time.get(event.context, 0) + time.time() - start_time)
+                    self._profiling_context_total_time.get(event.context, 0) + time.perf_counter() - start_time)
+        else:
+            try:
+                event.callback()
+            except Exception as e:
+                simulation_exception = e
 
-        for handler in self._handlers.values():
+        for handler in self._step_handlers:
             handler.after_simulation_step(self._iteration, event.timestamp)
 
         self._iteration += 1
@@ -291,8 +316,14 @@ class Simulator:
         self._logger.info("[--------- Simulation started ---------]")
         start_time = time.time()
 
+        if not self._configuration.real_time or _FORCE_FAST_EXECUTION:
+            while self.step_simulation():
+                pass
+            is_running = False
+        else:
+            is_running = True
+
         last_step_duration = 0
-        is_running = True
         while is_running:
             next_event = self._event_loop.peek_event()
 
@@ -329,19 +360,16 @@ class Simulator:
         Returns:
             True if the simulation is done, False otherwise
         """
-        if len(self._event_loop) == 0:
+        next_event = self._event_loop.peek_event()
+        if next_event is None:
             return True
 
-        if self._configuration.duration is not None:
-            current_time = self._event_loop.current_time
-
-            if current_time > self._configuration.duration:
-                return True
-
-        if self._configuration.max_iterations is not None and self._iteration >= self._configuration.max_iterations:
+        duration = self._configuration.duration
+        if duration is not None and next_event.timestamp > duration:
             return True
 
-        return False
+        max_iterations = self._configuration.max_iterations
+        return max_iterations is not None and self._iteration >= max_iterations
 
 
 class PositionScheme:

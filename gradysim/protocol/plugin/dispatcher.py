@@ -35,7 +35,7 @@ def _wrap_functionality(protocol: IProtocol, functionality: str, queue: List[Cal
     def wrapped_functionality(self: IProtocol, *args, **kwargs):
         for handler in queue:
             result = handler(self, *args, **kwargs)
-            if result == DispatchReturn.INTERRUPT:
+            if result is DispatchReturn.INTERRUPT:
                 break
 
     queue.append(getattr(protocol, functionality).__func__)
