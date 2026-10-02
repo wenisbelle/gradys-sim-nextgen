@@ -5,6 +5,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["gradys*"]
 
+[tool.setuptools.package-data]
+"gradysim.native" = ["include/gradysim_native/*.hpp"]
+
 [project]
 name = "gradysim"
 version = "0.8.0"
@@ -29,6 +32,9 @@ dependencies = [
     'numpy>=1.22',
     'aiohttp>=3.11.14'
 ]
+
+[project.optional-dependencies]
+native = ["pybind11>=2.10"]
 
 [project.urls]
 "Homepage" = "https://github.com/Project-GrADyS/gradys-sim-nextgen"
