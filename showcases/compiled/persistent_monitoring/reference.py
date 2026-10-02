@@ -45,7 +45,8 @@ class Patroller(IProtocol):
             if cell == self.target:
                 continue
             dx, dy, dz = cx - x, cy - y, cz - z
-            score = (now - self.last_visit[cell]) - _Shared.scenario.distance_weight * math.sqrt(dx * dx + dy * dy + dz * dz)
+            distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+            score = (now - self.last_visit[cell]) - _Shared.scenario.distance_weight * distance
             if score > best_score:
                 best, best_score = cell, score
         return best
